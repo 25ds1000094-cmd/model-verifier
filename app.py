@@ -7,14 +7,14 @@ import re
 
 app = Flask(__name__)
 
-REQUIRED_FILES = [
+REQUIRED_FILES = (
     "README.md",
     "training_manifest.json",
     "evaluation.json",
     "inventory.json",
     "adapter_model.safetensors",
     "adapter_config.json",
-]
+)
 
 UNSAFE_EXTENSIONS = (
     ".bin",
@@ -24,26 +24,45 @@ UNSAFE_EXTENSIONS = (
     ".pickle",
 )
 
-MAX_SAFE_INTEGER = 9007199254740991
+SAFE_INTEGER_MAX = 9007199254740991
 
-MODEL_CARD_PREFIX = "<!-- tds-model-card "
+MODEL_CARD_PREFIX = '<!-- tds-model-card '
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
-def utf8_bytes(value):
+def is_nonempty_string(value):
+    return isinstance(value, str) and len(value) > 0
+
+
+def is_safe_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 1
+        and value <= SAFE_INTEGER_MAX
+    )
+
+
+def utf8(value):
     return value.encode("utf-8")
 
 
-def sha256_utf8(value):
+def sha256(value):
     return hashlib.sha256(
-        utf8_bytes(value)
+        utf8(value)
     ).hexdigest()
 
 
 def compact_json(value):
+    """
+    Compact JSON representation.
+
+    ensure_ascii=False means Unicode characters are represented
+    as their actual UTF-8 characters rather than \\u escapes.
+    """
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -51,146 +70,185 @@ def compact_json(value):
     )
 
 
-def add(violations, code):
+def violation(violations, code):
     violations.add(code)
 
 
-def nonempty_string(value):
-    return (
-        isinstance(value, str)
-        and len(value) > 0
-    )
-
-
-def safe_integer(value):
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 1 <= value <= MAX_SAFE_INTEGER
-    )
-
-
 # ============================================================
-# REQUEST VALIDATION
+# POLICY
 # ============================================================
 
 def validate_policy(policy, violations):
 
     if not isinstance(policy, dict):
-        add(violations, "INVALID_POLICY")
+        violation(
+            violations,
+            "INVALID_POLICY",
+        )
         return
 
-    required = policy.get("requiredSlices")
+    required_slices = policy.get(
+        "requiredSlices"
+    )
 
-    if (
-        not isinstance(required, list)
-        or len(required) == 0
-        or any(
-            not nonempty_string(x)
-            for x in required
-        )
-        or len(set(required)) != len(required)
+    if not isinstance(
+        required_slices,
+        list,
     ):
-        add(violations, "INVALID_POLICY")
+        violation(
+            violations,
+            "INVALID_POLICY",
+        )
+
+    else:
+
+        if len(required_slices) == 0:
+            violation(
+                violations,
+                "INVALID_POLICY",
+            )
+
+        if any(
+            not is_nonempty_string(x)
+            for x in required_slices
+        ):
+            violation(
+                violations,
+                "INVALID_POLICY",
+            )
+
+        if len(set(required_slices)) != len(
+            required_slices
+        ):
+            violation(
+                violations,
+                "INVALID_POLICY",
+            )
 
     for field in (
         "license",
         "intendedUse",
         "limitations",
     ):
-        if not nonempty_string(
+
+        if not is_nonempty_string(
             policy.get(field)
         ):
-            add(violations, "INVALID_POLICY")
+            violation(
+                violations,
+                "INVALID_POLICY",
+            )
 
 
-def validate_file_values(files, violations):
+# ============================================================
+# FILE INPUT
+# ============================================================
 
-    for name, value in files.items():
+def validate_files(files, violations):
+
+    for name, content in files.items():
 
         if not isinstance(name, str):
-            add(violations, "INVALID_POLICY")
+            violation(
+                violations,
+                "INVALID_POLICY",
+            )
             continue
 
-        if not isinstance(value, str):
-            add(
+        # The request says files are UTF-8 strings.
+        if not isinstance(content, str):
+            violation(
                 violations,
                 f"INVALID_FILE:{name}",
             )
 
 
-def check_required_files(files, violations):
+def check_required_files(
+    files,
+    violations,
+):
 
     for name in REQUIRED_FILES:
+
         if name not in files:
-            add(
+            violation(
                 violations,
                 f"MISSING_FILE:{name}",
             )
 
 
-def check_extra_and_unsafe_files(
+def check_extra_files(
     files,
     violations,
 ):
 
-    required_names = set(REQUIRED_FILES)
+    required = set(REQUIRED_FILES)
 
     for name in files:
 
         if not isinstance(name, str):
             continue
 
-        # Any file outside the six required files is extra.
-        if name not in required_names:
-            add(
+        if name not in required:
+            violation(
                 violations,
                 "UNTRACKED_FILE",
             )
 
-        # Unsafe weight extensions are always rejected.
-        lower = name.lower()
 
-        if lower.endswith(
+def check_unsafe_extensions(
+    files,
+    violations,
+):
+
+    for name in files:
+
+        if not isinstance(name, str):
+            continue
+
+        lowered = name.lower()
+
+        if lowered.endswith(
             UNSAFE_EXTENSIONS
         ):
-            add(
+            violation(
                 violations,
                 "UNSAFE_WEIGHTS",
             )
 
 
 # ============================================================
-# JSON
+# JSON PARSING
 # ============================================================
 
-def parse_json_file(
+def parse_json(
     files,
-    name,
+    filename,
     violations,
 ):
 
-    if name not in files:
+    if filename not in files:
         return None
 
-    value = files[name]
+    content = files[filename]
 
-    if not isinstance(value, str):
-        # Already reported by validate_file_values.
+    if not isinstance(content, str):
         return None
 
     try:
-        return json.loads(value)
+        return json.loads(content)
 
     except (
         json.JSONDecodeError,
         ValueError,
         TypeError,
     ):
-        add(
+
+        violation(
             violations,
-            f"INVALID_JSON:{name}",
+            f"INVALID_JSON:{filename}",
         )
+
         return None
 
 
@@ -198,46 +256,41 @@ def parse_json_file(
 # INVENTORY
 # ============================================================
 
-def verify_inventory(
+def recompute_inventory(
     files,
-    inventory,
     violations,
 ):
+    """
+    Construct the inventory from the actual submitted files.
 
-    if not isinstance(inventory, list):
+    inventory.json itself is excluded.
 
-        add(
-            violations,
-            "INVENTORY_MISMATCH",
-        )
+    Every other file must be a UTF-8 string.
+    """
 
-        return ""
+    names = []
 
-    # --------------------------------------------------------
-    # Build the expected inventory from the actual files.
-    # --------------------------------------------------------
+    for name in files:
 
-    filenames = [
-        name
-        for name in files
-        if name != "inventory.json"
-        and isinstance(name, str)
-    ]
+        if name == "inventory.json":
+            continue
 
-    # UTF-8 byte ordering.
-    filenames.sort(
+        if isinstance(name, str):
+            names.append(name)
+
+    # Sort by UTF-8 bytes, not locale or case.
+    names.sort(
         key=lambda name: name.encode("utf-8")
     )
 
-    expected = []
+    result = []
 
-    for name in filenames:
+    for name in names:
 
         content = files[name]
 
-        # Every bundle file must be a UTF-8 string.
         if not isinstance(content, str):
-            add(
+            violation(
                 violations,
                 f"INVALID_FILE:{name}",
             )
@@ -245,7 +298,7 @@ def verify_inventory(
 
         raw = content.encode("utf-8")
 
-        expected.append({
+        result.append({
             "name": name,
             "bytes": len(raw),
             "sha256": hashlib.sha256(
@@ -253,82 +306,131 @@ def verify_inventory(
             ).hexdigest(),
         })
 
+    return result
+
+
+def verify_inventory(
+    files,
+    supplied_inventory,
+    violations,
+):
+
+    # If inventory isn't a JSON array,
+    # it cannot be a valid inventory.
+    if not isinstance(
+        supplied_inventory,
+        list,
+    ):
+
+        violation(
+            violations,
+            "INVENTORY_MISMATCH",
+        )
+
+        # Still calculate a digest from the
+        # actual files.
+        expected = recompute_inventory(
+            files,
+            violations,
+        )
+
+        return sha256(
+            compact_json(expected)
+        )
+
+    expected = recompute_inventory(
+        files,
+        violations,
+    )
+
     # --------------------------------------------------------
-    # Validate the structure of the supplied inventory.
+    # Each inventory entry must have EXACTLY:
+    #
+    # name, bytes, sha256
+    #
+    # and that exact key order.
     # --------------------------------------------------------
 
-    for entry in inventory:
+    structure_valid = True
 
-        if not isinstance(entry, dict):
+    for entry in supplied_inventory:
 
-            add(
-                violations,
-                "INVENTORY_MISMATCH",
-            )
+        if not isinstance(
+            entry,
+            dict,
+        ):
 
-            continue
+            structure_valid = False
+            break
 
-        # Exact key order is required.
         if list(entry.keys()) != [
             "name",
             "bytes",
             "sha256",
         ]:
-            add(
-                violations,
-                "INVENTORY_MISMATCH",
-            )
 
-    # --------------------------------------------------------
-    # Exact comparison.
-    #
-    # This simultaneously checks:
-    # - number of entries
-    # - filename
-    # - byte count
-    # - SHA-256
-    # - filename order
-    # --------------------------------------------------------
+            structure_valid = False
+            break
 
-    if inventory != expected:
+    if not structure_valid:
 
-        add(
+        violation(
             violations,
             "INVENTORY_MISMATCH",
         )
 
     # --------------------------------------------------------
-    # Explicitly detect missing tracked files.
+    # Exact list comparison.
+    #
+    # This checks:
+    # - number of entries
+    # - names
+    # - byte counts
+    # - hashes
+    # - order
+    # - duplicates
+    # - extra inventory entries
     # --------------------------------------------------------
 
-    supplied_names = set()
+    if supplied_inventory != expected:
 
-    for entry in inventory:
+        violation(
+            violations,
+            "INVENTORY_MISMATCH",
+        )
+
+    # --------------------------------------------------------
+    # Explicitly detect files missing from inventory.
+    # --------------------------------------------------------
+
+    tracked_names = set()
+
+    for entry in supplied_inventory:
 
         if isinstance(entry, dict):
 
             name = entry.get("name")
 
             if isinstance(name, str):
-                supplied_names.add(name)
+                tracked_names.add(name)
 
-    for name in filenames:
+    for entry in expected:
 
-        if name not in supplied_names:
+        name = entry["name"]
 
-            add(
+        if name not in tracked_names:
+
+            violation(
                 violations,
                 "UNTRACKED_FILE",
             )
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # inventoryDigest is based on the RECOMPUTED inventory,
-    # never on the attacker's inventory.json.
+    # inventoryDigest MUST be calculated from the
+    # RECOMPUTED inventory.
     # --------------------------------------------------------
 
-    return sha256_utf8(
+    return sha256(
         compact_json(expected)
     )
 
@@ -342,9 +444,12 @@ def verify_adapter_config(
     violations,
 ):
 
-    if not isinstance(config, dict):
+    if not isinstance(
+        config,
+        dict,
+    ):
 
-        add(
+        violation(
             violations,
             "INVALID_ADAPTER_CONFIG",
         )
@@ -352,32 +457,55 @@ def verify_adapter_config(
         return
 
     r = config.get("r")
+
     targets = config.get(
         "target_modules"
     )
 
-    if not safe_integer(r):
+    if not is_safe_integer(r):
 
-        add(
+        violation(
             violations,
             "INVALID_ADAPTER_CONFIG",
         )
 
-    if (
-        not isinstance(targets, list)
-        or len(targets) == 0
-        or any(
-            not nonempty_string(x)
-            for x in targets
-        )
-        or len(set(targets))
-        != len(targets)
+    if not isinstance(
+        targets,
+        list,
     ):
 
-        add(
+        violation(
             violations,
             "INVALID_ADAPTER_CONFIG",
         )
+
+    else:
+
+        if len(targets) == 0:
+
+            violation(
+                violations,
+                "INVALID_ADAPTER_CONFIG",
+            )
+
+        if any(
+            not is_nonempty_string(x)
+            for x in targets
+        ):
+
+            violation(
+                violations,
+                "INVALID_ADAPTER_CONFIG",
+            )
+
+        if len(set(targets)) != len(
+            targets
+        ):
+
+            violation(
+                violations,
+                "INVALID_ADAPTER_CONFIG",
+            )
 
 
 # ============================================================
@@ -390,16 +518,19 @@ def verify_training_manifest(
     violations,
 ):
 
-    if not isinstance(manifest, dict):
+    if not isinstance(
+        manifest,
+        dict,
+    ):
 
-        add(
+        violation(
             violations,
             "INVALID_TRAINING_MANIFEST",
         )
 
         return
 
-    fields = [
+    required_fields = (
         "baseRevision",
         "task",
         "datasetDigest",
@@ -407,28 +538,34 @@ def verify_training_manifest(
         "trainingConfigDigest",
         "modelArtifactDigest",
         "evaluationArtifactDigest",
-    ]
+    )
 
-    for field in fields:
+    # --------------------------------------------------------
+    # Required fields.
+    # --------------------------------------------------------
+
+    for field in required_fields:
 
         if field not in manifest:
 
-            add(
+            violation(
                 violations,
                 f"MISSING_MANIFEST_FIELD:{field}",
             )
 
-        elif not nonempty_string(
+        elif not is_nonempty_string(
             manifest[field]
         ):
 
-            add(
+            violation(
                 violations,
                 "INVALID_TRAINING_MANIFEST",
             )
 
     # --------------------------------------------------------
-    # Immutable base revision.
+    # baseRevision must be exactly:
+    #
+    # 40 lowercase hexadecimal characters.
     # --------------------------------------------------------
 
     revision = manifest.get(
@@ -443,13 +580,13 @@ def verify_training_manifest(
         ) is None
     ):
 
-        add(
+        violation(
             violations,
             "MUTABLE_BASE_REVISION",
         )
 
     # --------------------------------------------------------
-    # MODEL ARTIFACT DIGEST
+    # Model artifact digest.
     # --------------------------------------------------------
 
     if (
@@ -461,25 +598,33 @@ def verify_training_manifest(
             "adapter_model.safetensors"
         ]
 
-        if isinstance(model, str):
+        if isinstance(
+            model,
+            str,
+        ):
 
-            actual = sha256_utf8(
+            actual_model_digest = sha256(
                 model
             )
 
-            expected = manifest.get(
-                "modelArtifactDigest"
+            declared_model_digest = (
+                manifest.get(
+                    "modelArtifactDigest"
+                )
             )
 
-            if actual != expected:
+            if (
+                actual_model_digest
+                != declared_model_digest
+            ):
 
-                add(
+                violation(
                     violations,
                     "MODEL_ARTIFACT_MISMATCH",
                 )
 
     # --------------------------------------------------------
-    # EVALUATION ARTIFACT DIGEST
+    # Evaluation artifact digest.
     # --------------------------------------------------------
 
     if "evaluation.json" in files:
@@ -493,17 +638,22 @@ def verify_training_manifest(
             str,
         ):
 
-            actual = sha256_utf8(
-                evaluation
+            actual_evaluation_digest = (
+                sha256(evaluation)
             )
 
-            expected = manifest.get(
-                "evaluationArtifactDigest"
+            declared_evaluation_digest = (
+                manifest.get(
+                    "evaluationArtifactDigest"
+                )
             )
 
-            if actual != expected:
+            if (
+                actual_evaluation_digest
+                != declared_evaluation_digest
+            ):
 
-                add(
+                violation(
                     violations,
                     "EVALUATION_ARTIFACT_MISMATCH",
                 )
@@ -512,6 +662,22 @@ def verify_training_manifest(
 # ============================================================
 # EVALUATION
 # ============================================================
+
+def valid_score(value):
+
+    return (
+        isinstance(
+            value,
+            (int, float),
+        )
+        and not isinstance(
+            value,
+            bool,
+        )
+        and math.isfinite(value)
+        and 0 <= value <= 1
+    )
+
 
 def verify_evaluation(
     evaluation,
@@ -525,14 +691,17 @@ def verify_evaluation(
         dict,
     ):
 
-        add(
+        violation(
             violations,
             "INVALID_EVALUATION",
         )
 
         return
 
-    # Evaluation must bind to this exact model.
+    # --------------------------------------------------------
+    # Bind evaluation to the exact model artifact.
+    # --------------------------------------------------------
+
     if (
         evaluation.get(
             "modelArtifactDigest"
@@ -542,38 +711,28 @@ def verify_evaluation(
         )
     ):
 
-        add(
+        violation(
             violations,
             "EVALUATION_DIGEST_MISMATCH",
         )
 
+    # --------------------------------------------------------
     # Aggregate.
-    aggregate = evaluation.get(
-        "aggregate"
-    )
+    # --------------------------------------------------------
 
-    if (
-        not isinstance(
-            aggregate,
-            (int, float),
-        )
-        or isinstance(
-            aggregate,
-            bool,
-        )
-        or not math.isfinite(
-            aggregate
-        )
-        or aggregate < 0
-        or aggregate > 1
+    if not valid_score(
+        evaluation.get("aggregate")
     ):
 
-        add(
+        violation(
             violations,
             "INVALID_AGGREGATE",
         )
 
+    # --------------------------------------------------------
     # Required slices.
+    # --------------------------------------------------------
+
     slices = evaluation.get(
         "slices"
     )
@@ -583,55 +742,39 @@ def verify_evaluation(
         dict,
     ):
 
-        for required in policy.get(
+        for name in policy.get(
             "requiredSlices",
             [],
         ):
 
-            add(
+            violation(
                 violations,
-                f"MISSING_SLICE:{required}",
+                f"MISSING_SLICE:{name}",
             )
 
         return
 
-    for required in policy.get(
+    for name in policy.get(
         "requiredSlices",
         [],
     ):
 
-        if required not in slices:
+        if name not in slices:
 
-            add(
+            violation(
                 violations,
-                f"MISSING_SLICE:{required}",
+                f"MISSING_SLICE:{name}",
             )
 
             continue
 
-        value = slices[
-            required
-        ]
-
-        if (
-            not isinstance(
-                value,
-                (int, float),
-            )
-            or isinstance(
-                value,
-                bool,
-            )
-            or not math.isfinite(
-                value
-            )
-            or value < 0
-            or value > 1
+        if not valid_score(
+            slices[name]
         ):
 
-            add(
+            violation(
                 violations,
-                f"SLICE_RANGE:{required}",
+                f"SLICE_RANGE:{name}",
             )
 
 
@@ -639,32 +782,32 @@ def verify_evaluation(
 # MODEL CARD
 # ============================================================
 
-def find_model_cards(readme):
+def find_model_card_markers(
+    readme,
+):
 
-    positions = []
+    result = []
 
-    start = 0
+    position = 0
 
     while True:
 
-        position = readme.find(
+        found = readme.find(
             MODEL_CARD_PREFIX,
-            start,
+            position,
         )
 
-        if position == -1:
+        if found == -1:
             break
 
-        positions.append(
-            position
-        )
+        result.append(found)
 
-        start = (
-            position
+        position = (
+            found
             + len(MODEL_CARD_PREFIX)
         )
 
-    return positions
+    return result
 
 
 def verify_model_card(
@@ -674,22 +817,24 @@ def verify_model_card(
     violations,
 ):
 
-    positions = find_model_cards(
+    markers = find_model_card_markers(
         readme
     )
 
     # --------------------------------------------------------
-    # ZERO MARKERS
+    # No marker:
+    #
+    # MODEL_CARD_COUNT + MISSING_MODEL_CARD
     # --------------------------------------------------------
 
-    if len(positions) == 0:
+    if len(markers) == 0:
 
-        add(
+        violation(
             violations,
             "MODEL_CARD_COUNT",
         )
 
-        add(
+        violation(
             violations,
             "MISSING_MODEL_CARD",
         )
@@ -697,12 +842,14 @@ def verify_model_card(
         return
 
     # --------------------------------------------------------
-    # MULTIPLE MARKERS
+    # Multiple markers:
+    #
+    # ONLY MODEL_CARD_COUNT
     # --------------------------------------------------------
 
-    if len(positions) > 1:
+    if len(markers) > 1:
 
-        add(
+        violation(
             violations,
             "MODEL_CARD_COUNT",
         )
@@ -710,11 +857,11 @@ def verify_model_card(
         return
 
     # --------------------------------------------------------
-    # ONE MARKER
+    # Exactly one marker.
     # --------------------------------------------------------
 
     start = (
-        positions[0]
+        markers[0]
         + len(MODEL_CARD_PREFIX)
     )
 
@@ -725,7 +872,7 @@ def verify_model_card(
 
     if end == -1:
 
-        add(
+        violation(
             violations,
             "INVALID_MODEL_CARD",
         )
@@ -734,9 +881,10 @@ def verify_model_card(
 
     payload = readme[
         start:end
-    ].strip()
+    ]
 
-    # json.loads correctly understands braces inside strings.
+    # The entire payload between the prefix and -->
+    # is parsed. Do not attempt to parse braces manually.
     try:
 
         card = json.loads(
@@ -749,19 +897,20 @@ def verify_model_card(
         TypeError,
     ):
 
-        add(
+        violation(
             violations,
             "INVALID_MODEL_CARD",
         )
 
         return
 
+    # Parsed JSON must be an object.
     if not isinstance(
         card,
         dict,
     ):
 
-        add(
+        violation(
             violations,
             "INVALID_MODEL_CARD",
         )
@@ -796,11 +945,12 @@ def verify_model_card(
 
         if card.get(field) != expected_value:
 
-            add(
+            violation(
                 violations,
                 "MODEL_CARD_MISMATCH",
             )
 
+            # Only one code is needed.
             return
 
 
@@ -812,7 +962,7 @@ def verify_model_card(
 def verify_bundle():
 
     # --------------------------------------------------------
-    # HTTP input validation
+    # HTTP input validation.
     # --------------------------------------------------------
 
     if not request.is_json:
@@ -834,18 +984,19 @@ def verify_bundle():
             "error": "INVALID_INPUT"
         }), 400
 
-    # Missing policy = HTTP 400.
+    # A missing policy is specifically HTTP 400.
     if "policy" not in body:
 
         return jsonify({
             "error": "INVALID_INPUT"
         }), 400
 
-    # files must be an object.
     files = body.get(
         "files"
     )
 
+    # A missing files property or non-object files
+    # is invalid input.
     if not isinstance(
         files,
         dict,
@@ -862,7 +1013,7 @@ def verify_bundle():
     violations = set()
 
     # --------------------------------------------------------
-    # Basic checks
+    # Basic validation.
     # --------------------------------------------------------
 
     validate_policy(
@@ -870,7 +1021,7 @@ def verify_bundle():
         violations,
     )
 
-    validate_file_values(
+    validate_files(
         files,
         violations,
     )
@@ -880,57 +1031,74 @@ def verify_bundle():
         violations,
     )
 
-    check_extra_and_unsafe_files(
+    check_extra_files(
+        files,
+        violations,
+    )
+
+    check_unsafe_extensions(
         files,
         violations,
     )
 
     # --------------------------------------------------------
-    # Parse JSON files
+    # Parse JSON documents.
     # --------------------------------------------------------
 
-    inventory = parse_json_file(
+    inventory = parse_json(
         files,
         "inventory.json",
         violations,
     )
 
-    adapter_config = parse_json_file(
+    adapter_config = parse_json(
         files,
         "adapter_config.json",
         violations,
     )
 
-    manifest = parse_json_file(
+    manifest = parse_json(
         files,
         "training_manifest.json",
         violations,
     )
 
-    evaluation = parse_json_file(
+    evaluation = parse_json(
         files,
         "evaluation.json",
         violations,
     )
 
     # --------------------------------------------------------
-    # Inventory
+    # Inventory verification.
     # --------------------------------------------------------
-
-    inventory_digest = ""
 
     if "inventory.json" in files:
 
-        inventory_digest = (
-            verify_inventory(
-                files,
-                inventory,
-                violations,
+        inventory_digest = verify_inventory(
+            files,
+            inventory,
+            violations,
+        )
+
+    else:
+
+        # No inventory file exists, so there is no
+        # supplied inventory to trust. Calculate the
+        # digest from what can be recomputed anyway.
+        expected_inventory = recompute_inventory(
+            files,
+            violations,
+        )
+
+        inventory_digest = sha256(
+            compact_json(
+                expected_inventory
             )
         )
 
     # --------------------------------------------------------
-    # Adapter config
+    # Adapter configuration.
     # --------------------------------------------------------
 
     if "adapter_config.json" in files:
@@ -941,7 +1109,7 @@ def verify_bundle():
         )
 
     # --------------------------------------------------------
-    # Training manifest
+    # Training manifest.
     # --------------------------------------------------------
 
     if "training_manifest.json" in files:
@@ -953,13 +1121,17 @@ def verify_bundle():
         )
 
     # --------------------------------------------------------
-    # Evaluation
+    # Evaluation.
     # --------------------------------------------------------
 
     if (
         "evaluation.json" in files
         and isinstance(
             manifest,
+            dict,
+        )
+        and isinstance(
+            policy,
             dict,
         )
     ):
@@ -972,7 +1144,7 @@ def verify_bundle():
         )
 
     # --------------------------------------------------------
-    # Model card
+    # Model card.
     # --------------------------------------------------------
 
     if "README.md" in files:
@@ -986,8 +1158,38 @@ def verify_bundle():
             str,
         ):
 
-            if isinstance(
+            markers = (
+                find_model_card_markers(
+                    readme
+                )
+            )
+
+            # If multiple markers exist, the assignment says
+            # ONLY MODEL_CARD_COUNT.
+            if len(markers) > 1:
+
+                violation(
+                    violations,
+                    "MODEL_CARD_COUNT",
+                )
+
+            elif len(markers) == 0:
+
+                violation(
+                    violations,
+                    "MODEL_CARD_COUNT",
+                )
+
+                violation(
+                    violations,
+                    "MISSING_MODEL_CARD",
+                )
+
+            elif isinstance(
                 manifest,
+                dict,
+            ) and isinstance(
+                policy,
                 dict,
             ):
 
@@ -1000,55 +1202,34 @@ def verify_bundle():
 
             else:
 
-                positions = find_model_cards(
-                    readme
+                # There is one marker but the machine-readable
+                # information needed for comparison is invalid.
+                # The marker itself is present, so do not report
+                # it as missing.
+                violation(
+                    violations,
+                    "MODEL_CARD_MISMATCH",
                 )
 
-                if len(positions) == 0:
-
-                    add(
-                        violations,
-                        "MODEL_CARD_COUNT",
-                    )
-
-                    add(
-                        violations,
-                        "MISSING_MODEL_CARD",
-                    )
-
-                elif len(positions) > 1:
-
-                    add(
-                        violations,
-                        "MODEL_CARD_COUNT",
-                    )
-
-                else:
-
-                    add(
-                        violations,
-                        "MODEL_CARD_MISMATCH",
-                    )
-
     # --------------------------------------------------------
-    # Deterministic output
+    # Deterministic violation ordering.
     # --------------------------------------------------------
 
-    sorted_violations = sorted(
+    ordered_violations = sorted(
         violations,
-        key=lambda value:
-            value.encode("utf-8"),
+        key=lambda x: x.encode("utf-8"),
     )
 
     decision = (
         "admit"
-        if len(sorted_violations) == 0
+        if len(ordered_violations) == 0
         else "reject"
     )
 
+    # EXACT response shape.
     return jsonify({
         "decision": decision,
-        "violations": sorted_violations,
+        "violations": ordered_violations,
         "inventoryDigest": inventory_digest,
     })
 
